@@ -5147,7 +5147,7 @@ EOF
 		 echo -e "\t4. Mobility pending syncevents by User"
 		 echo -e "\t5. View Attachments by User"
 		 echo -e "\n\t6. Check Mobility attachments (CAUTION)"
-		 echo -e "\t7. Check Mobility attachments counts (BETA)"
+		 echo -e "\t7. Check Mobility attachments counts"
 		 echo -e "\t8. Watch psql command (CAUTION)"
 		 echo -e "\n\t0. Back"
 		 echo -n -e "\n\tSelection: "
