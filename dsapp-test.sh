@@ -8,7 +8,7 @@
 #
 ##################################################################################################
 
-dsappversion='207'
+dsappversion='210'
 
 ##################################################################################################
 #	Set up banner logo
@@ -106,24 +106,19 @@ EOF
 	fi
 
 	function checkInstall {
-	# Check for Mobility installed.
-	dsInstalled=`chkconfig | grep -iom 1 datasync`;
-	if [ "$dsInstalled" != "datasync" ];then
-		dsInstalledCheck=false
-	else
-		dsInstalledCheck=true
-	fi
-	}
-	checkInstall;
-	
+	# Check if Mobility is installed.
 	if [[ "$forceMode" -ne "1" ]];then
-		if (! $dsInstalledCheck);then
+		local dsInstalled=`chkconfig | grep -iom 1 datasync`;
+		if [ "$dsInstalled" != "datasync" ];then
 			datasyncBanner;
 			read -p "Mobility is not installed."
 			clear;
 			exit 1;
 		fi
 	fi
+	}
+
+	checkInstall;
 
 ##################################################################################################
 #	Declaration of Variables
@@ -602,16 +597,20 @@ function autoUpdateDsapp {
 		if (checkFTP);then
 
 			# Fetch online dsapp and store to memory, check version
-			publicVersion=`curl -s ftp://ftp.novell.com/outgoing/dsapp-version.info | grep -m1 dsappversion= | cut -f2 -d "'"`
+			publicVersion=`curl --connect-timeout 3 -s ftp://ftp.novell.com/outgoing/dsapp-version.info | grep -m1 dsappversion= | cut -f2 -d "'"`
 			log_debug "[Init] [autoUpdateDsapp] publicVersion: $publicVersion, currentVersion: $dsappversion"
 			# publicVersion=`curl -s ftp://ftp.novell.com/outgoing/$dsapp_tar | tar -Oxz 2>/dev/null | grep -m1 dsappversion= | cut -f2 -d "'"`
 
+			clear; echo -e "\nChecking for new dsapp..."
+
 			# Download if newer version is available
-			if [ "$dsappversion" -ne "$publicVersion" ];then
-					clear;
-					echo -e "\nChecking for new dsapp..."
-					echo -e "v$dsappversion (v$publicVersion available)"
-					updateDsapp
+			if [ -n "$publicVersion" ];then
+				if [ "$dsappversion" -lt "$publicVersion" ];then
+						echo -e "v$dsappversion (v$publicVersion available)"
+						updateDsapp
+				fi
+			else
+				clear; echo -e "Connection timed out.";
 			fi
 		fi
 	fi
@@ -633,7 +632,7 @@ function autoUpdateDsapp {
 		if [ -f "/root/.pgpass" ];then
 			# If the file is there, does it have a password?
 			if [[ -n `cat /root/.pgpass | cut -d ':' -f5` ]]; then
-				dbLogin=`psql -U $dbUsername datasync -c "\d" 2>/dev/null`;
+				dbLogin=`psql -U $dbUsername -l 2>/dev/null`;
 				if [ $? -eq '0' ];then
 					echo "0";
 				else
@@ -937,7 +936,7 @@ log_debug "[Init] [getsmtpPassword] $smtpPassword"
 		fi
 		yastRun=`ps aux | grep -i yast | awk '{print $2}' | sed '$d'`
 		if [ -n "$yastRun" ];then
-			echo -e "YaST could not be closed. Aborting install"
+			echo -e "YaST could not be closed. Aborting..."
 			return 1;
 		else return 0;
 		fi
@@ -1436,7 +1435,7 @@ function mCleanup { # Requires userID passed in.
 
 	# Get filestoreIDs that are safe to delete
 	local fileID=`psql -U $dbUsername mobility -t -c "SELECT filestoreid FROM attachments LEFT OUTER JOIN attachmentmaps ON attachments.attachmentid=attachmentmaps.attachmentid WHERE attachmentmaps.attachmentid IS NULL;" | sed 's/^ *//' | sed 's/ *$//'`
-	
+
 	# Log into mobility database, and clean tables with users guid
 	psql -U $dbUsername mobility <<EOF
 	delete from deviceimages where userid='$uGuid';
@@ -1454,16 +1453,41 @@ EOF
 		psql -U $dbUsername mobility -c "delete from attachments where attachmentid='$line';" &>/dev/null
 	done <<< "$uAttachment"
 
-	# While loop to delete all 'safe to delete' attachments from the file system
+	# While loop to remove orphaned filestoreids
+	while IFS= read -r line
+	do
+		psql -U $dbUsername mobility -c "delete from attachments where filestoreid='$line';" &>/dev/null
+	done <<< "$fileID"
+
+	# Remove duplicate fileIDs
+	echo -e "Generating list of files..."
+	echo "$fileID" >> $dsappLogs/fileIDs;
+	cat $dsappLogs/fileIDs | sort | uniq > $dsappLogs/fileIDs.tmp; mv $dsappLogs/fileIDs.tmp $dsappLogs/fileIDs;
+	sed -i '/^\s*$/d' $dsappLogs/fileIDs;
+	fileID=`cat $dsappLogs/fileIDs`;
+
+	# echo to output
 	if [ -n "$fileID" ];then
-		echo -e "\nCleaning up `echo $fileID|wc -w` attachments\nPlease wait."
+		echo -e "\nCleaning `echo $fileID|wc -w` attachments."
+	fi
+
+	# While loop to delete all 'safe to delete' attachments from the file system (runs in background)
+	if [ -n "$fileID" ];then
+		echo -e "\n"`date`"\n------- Cleaning `echo $fileID|wc -w` attachments -------" >> $dsappLogs/mCleanup.log
+		local attachmentCount=0;
 		while IFS= read -r line
 		do
 			if [ -f "$mAttach`python $dsapplib/filestoreIdToPath.pyc $line`" ];then 
-				rm -f $mAttach`python $dsapplib/filestoreIdToPath.pyc $line`
+				rm -fv $mAttach`python $dsapplib/filestoreIdToPath.pyc $line` >> $dsappLogs/mCleanup.log
+				attachmentCount=$(($attachmentCount + 1));
+			else
+				echo -e "Warning : FileID $line not found" >> $dsappLogs/mCleanup.log
 			fi
+			sed -i "/$line/d" $dsappLogs/fileIDs;
+			fileID=`cat $dsappLogs/fileIDs`;
 		done <<< "$fileID"
-	fi
+		echo -e "------- Complete : $attachmentCount files removed -------" >> $dsappLogs/mCleanup.log
+	fi &
 }
 
 function dCleanup { # Requires userID passed in.
@@ -1477,7 +1501,7 @@ function dCleanup { # Requires userID passed in.
 	local psqlAppNameM=`psql -U $dbUsername datasync -t -c "select \"targetName\" from targets where (dn ~* '($1[.|,].*)$' OR dn ilike '$1' OR \"targetName\" ilike '$1') AND \"connectorID\"='default.pipeline1.mobility';"| sed 's/^ *//' | sed 's/ *$//'`
 	
 	# Get all creationEventIDs from objectMappins
-	echo "Building creationEventID list..."
+	echo "Generating creationEventID list..."
 	local uEventID=`psql -U $dbUsername datasync -t -c "select \"objectID\",\"creationEventID\" from \"objectMappings\" where \"objectID\" ilike '%|$psqlAppNameG' OR \"objectID\" ilike '%|$psqlAppNameM' OR \"objectID\" ilike '%|$1';" | cut -f3 -d '|' | rev | cut -f1 -d '.' | rev`
 
 	# While loop to delete objectMappings
@@ -1873,9 +1897,9 @@ function checkNightlyMaintenance {
 	grep -iw "<databaseMaintenance>1</databaseMaintenance>" $mconf
 	if [ $? -ne 0 ]; then
 		problem=true
-	fi
-
-	echo -e "\nNightly Maintenance History:"
+		echo -e "\nNightly Maintenance disabled\n"
+	else
+		echo -e "\nNightly Maintenance History:"
 	history=`grep -i  "nightly maintenance" $mAlog | tail -5`
 	if [ -z "$history" ]; then
 		for file in `ls -t $mAlog-* 2>/dev/null | head -5`
@@ -1889,12 +1913,14 @@ function checkNightlyMaintenance {
 		done
 
 		if [ -z "$history" ]; then
-			echo -e "Nothing found. Nightly Maintenance has not run recently."
+			echo -e "Nothing found. Nightly Maintenance may have not run recently."
 			problem=true
 		fi
 	else echo -e "$mAlog\n""$history"
 	fi
 	echo ""
+	fi
+
 	if ($problem); then 
 		return 1 
 	else return 0
@@ -1976,34 +2002,43 @@ function changeDBPass {
 		#Get Encrypted password from user input
 		local inputEncrpt=$(encodeString $input)
 
-		# Backup conf files
-		backupConf "changeDBPass";
+		echo "Changing database password..."
+		su postgres -c "cd /;psql -c \"ALTER USER datasync_user WITH password '"$input"';\"" 1>/dev/null 2>$dsapptmp/psql-error
+		if [ `cat "$dsapptmp/psql-error" | wc -c` -eq 0 ];then
+			# Backup conf files
+			backupConf "changeDBPass";
 
-		echo "Changing database password"
-		su postgres -c "psql -c \"ALTER USER datasync_user WITH password '"$input"';\"" &>/dev/null
-		lineNumber=`cat --number $ceconf | sed -n "/<database>/,/<\/database>/p" | grep -i password | awk '{print $1}'`
+			lineNumber=`cat --number $ceconf | sed -n "/<database>/,/<\/database>/p" | grep -i password | awk '{print $1}'`
 
-		if [[ $(isStringProtected /config/configengine/database $ceconf) -eq 1 ]];then
-			sed -i ""$lineNumber"s|<password>.*</password>|<password>"$inputEncrpt"</password>|g" $ceconf
+			if [[ $(isStringProtected /config/configengine/database $ceconf) -eq 1 ]];then
+				sed -i ""$lineNumber"s|<password>.*</password>|<password>"$inputEncrpt"</password>|g" $ceconf
+			else
+				sed -i ""$lineNumber"s|<password>.*</password>|<password>"$input"</password>|g" $ceconf
+			fi
+
+			if [[ $(isStringProtected /engine/settings/database $econf) -eq 1 ]];then
+				sed -i "s|<password>.*</password>|<password>"$inputEncrpt"</password>|g" $econf
+			else
+				sed -i "s|<password>.*</password>|<password>"$input"</password>|g" $econf
+			fi
+
+			if [[ $(isStringProtected /connector/settings/custom $mconf) -eq 1 ]];then
+				sed -i "s|<dbpass>.*</dbpass>|<dbpass>"$inputEncrpt"</dbpass>|g" $mconf
+			else
+				sed -i "s|<dbpass>.*</dbpass>|<dbpass>"$input"</dbpass>|g" $mconf
+			fi
+
+			echo -e "\nDatabase password updated. Please restart mobility."
 		else
-			sed -i ""$lineNumber"s|<password>.*</password>|<password>"$input"</password>|g" $ceconf
+			echo -e "\nError : Failed changing database password".
+			if askYesOrNo "View error?";then
+				less $dsapptmp/psql-error;
+			fi
 		fi
-
-		if [[ $(isStringProtected /engine/settings/database $econf) -eq 1 ]];then
-			sed -i "s|<password>.*</password>|<password>"$inputEncrpt"</password>|g" $econf
-		else
-			sed -i "s|<password>.*</password>|<password>"$input"</password>|g" $econf
-		fi
-
-		if [[ $(isStringProtected /connector/settings/custom $mconf) -eq 1 ]];then
-			sed -i "s|<dbpass>.*</dbpass>|<dbpass>"$inputEncrpt"</dbpass>|g" $mconf
-		else
-			sed -i "s|<dbpass>.*</dbpass>|<dbpass>"$input"</dbpass>|g" $mconf
-		fi
-
-		echo -e "\nDatabase password updated. Please restart mobility."
 	fi
-	eContinue;
+	rm -f $dsapptmp/psql-error
+	echo;eContinue;
+
 }
 
 function changeAppName {
@@ -3803,6 +3838,14 @@ function installMobility { # $1 = repository name
 	# Source in configuration file
 	tar zxf $dumpFile; source $restoreFolder/mobilitySettings.conf
 
+	# Check variables have values before install
+	if [ -z "$dbPassword" ] || [ -z "$galUserName" ] || [ -z "$mPort" ] || [ -z "$mSecure" ] || [ -z "$gPort" ] || [ -z "$sListenAddress" ] || [ -z "$gListenAddress" ] || [ -z "$trustedName" ] || [ -z "$sPort" ] || [ -z "$sSecure" ];then
+		echo -e "Variable attribute missing for install. Check mobilitySettings.conf"
+		echo -e "dbPassword: $dbPassword \ngalUserName: $galUserName \nmPort: $mPort \nmSecure: $mSecure \ngPort: $gPort \nsListenAddress: $sListenAddress \ngListenAddress: $gListenAddress \ntrustedName: $trustedName \nsPort: $sPort \nsSecure: $sSecure"
+		echo; eContinue;
+		exit 1;
+	fi
+
 	local setupDir="$dirOptMobility/syncengine/connectors/mobility/cli"
 	local keyFile="$dsappConf/$trustedName.key"; echo "$trustedAppKey" > $keyFile;
 
@@ -3940,7 +3983,7 @@ function installMobility { # $1 = repository name
 				# Kill / stop mobility
 				killall -9 python;
 				rcDS stop silent;
-
+				
 				# Restore other configengine xml settings with awk as xmllint set has character limits
 				awk '/<notification>/{p=1;print;print "'$xmlNotification'"}/<\/notification>/{p=0}!p' $ceconf > $ceconf.2; mv $ceconf.2 $ceconf; xmllint --format $ceconf --output $ceconf
 				awk '/<ldap>/{p=1;print;print "'$xmlLDAP'"}/<\/ldap>/{p=0}!p' $ceconf > $ceconf.2; mv $ceconf.2 $ceconf; xmllint --format $ceconf --output $ceconf
@@ -3948,48 +3991,33 @@ function installMobility { # $1 = repository name
 					awk '/<gw>/{p=1;print;print "'$xmlgwAdmins'"}/<\/gw>/{p=0}!p' $ceconf > $ceconf.2; mv $ceconf.2 $ceconf; xmllint --format $ceconf --output $ceconf
 				fi
 
-				# Get correct passwords encryption
-				if [ -n "$smtpPassword" ];then
-					if [[ $(isStringProtected /config/configengine/notification $ceconf) -eq 1 ]];then
-						smtpPassword=`encodeString "$smtpPassword"`
-					fi
-				fi
-				if [[ $(isStringProtected /config/configengine/ldap/login $ceconf) -eq 1 ]];then
-					ldapPassword=`encodeString "$ldapPassword"`
-				fi
-				# Set trustedAppKey encryption
-				if [[ $(isStringProtected /connector/settings/custom $gconf) -eq 1 ]];then
-					trustedAppKey=`encodeString "$trustedAppKey"`
-				fi
-
+				# Restore the connector, and engine xml files
 				cd $dumpPath
-				
-				# Restore the connector xml files
 				cp $restoreFolder/etc/datasync/configengine/engines/default/pipelines/pipeline1/connectors/groupwise/connector.xml $gconf;
 				cp $restoreFolder/etc/datasync/configengine/engines/default/pipelines/pipeline1/connectors/mobility/connector.xml $mconf;
-				setXML "$gconf" '/connector/settings/custom/listeningLocation' "$IP"
-
-				# Restore engine.xml file
-				passProXML=`xmlpath 'engine/settings/database/protected' < $econf`
 				cp $restoreFolder/etc/datasync/configengine/engines/default/engine.xml $econf
-				
-				# Set all passwords / keys for hostname encryption
-				encdbPassword=`encodeString "$dbPassword"`
-				if [[ $(isStringProtected /config/configengine/database $ceconf) -eq 1 ]];then
-					setXML "$ceconf" '/config/configengine/database/password' "$encdbPassword"
-				fi
-				if [[ $(isStringProtected /engine/settings/database $econf) -eq 1 ]];then
-					setXML "$econf" '/engine/settings/database/password' "$encdbPassword"
-				fi
-				if [[ $(isStringProtected /connector/settings/custom $mconf) -eq 1 ]];then
-					setXML "$mconf" '/connector/settings/custom/dbpass' "$encdbPassword"
-				fi
 
+				# Remove <protected> lines from XML files
+				sed -i '/<protected>/d' `find $dirEtcMobility -name "*.xml"`
+
+				# Update XML values
+				setXML "$gconf" '/connector/settings/custom/listeningLocation' "$IP"
 				setXML "$ceconf" '/config/configengine/source/provisioning' "$provisioning"
 				setXML "$ceconf" '/config/configengine/source/authentication' "$authentication"
 				setXML "$ceconf" '/config/configengine/ldap/login/password' "$ldapPassword"
+				setXML "$ceconf" '/config/configengine/database/password' "$dbPassword"
+				setXML "$mconf" '/connector/settings/custom/dbpass' "$dbPassword"
+				setXML "$econf" '/engine/settings/database/password' "$dbPassword"
 				setXML "$ceconf" '/config/configengine/notification/smtpPassword' "$smtpPassword"
  				setXML "$gconf" '/connector/settings/custom/trustedAppKey' "$trustedAppKey"
+
+ 				# Update configuration files
+ 				echo -e "\nUpdating configuration files..."
+				export FEEDBACK=""
+				export LOGGER=""
+				python $dirOptMobility/common/lib/upgrade.pyc;
+				killall -9 python;
+				rcDS stop silent;
 
 				# Copy in old certificates
 				echo
@@ -3998,9 +4026,10 @@ function installMobility { # $1 = repository name
 					cp $restoreFolder/server.pem $dirVarMobility/webadmin/
 				fi
 
+				checkPGPASS;
+				
 				# Restore users and groups
 				if askYesOrNo "Restore users & groups?";then
-					checkPGPASS;
 					psql -U $dbUsername datasync < $restoreFolder/targets.sql 2>/dev/null
 					psql -U $dbUsername datasync < $restoreFolder/membershipCache.sql 2>/dev/null
 				fi
@@ -4316,15 +4345,16 @@ cd $cPWD;
  echo -e "\t3. Database"
  echo -e "\t4. Certificates"
  echo -e "\n\t5. User Issues"
- echo -e "\t6. Checks & Queries"
+ echo -e "\t6. User Info"
+ echo -e "\t7. Checks & Queries"
  echo -e "\n\t0. Quit"
  echo -n -e "\n\tSelection: "; tput sc
- echo -e "\n\n\n\tDisclaimer: Use at your own discretion, not supported by Novell.\n\tSee [dsapp --bug] to report issues."
+ echo -e "\n\n\tUse at your own discretion. dsapp is not supported by Novell.\n\tSee [dsapp --bug] to report issues."
  tput rc; read -n1 opt;
  a=true;
  case $opt in
 
- d) clear; ###Log into Database### --Not on Menu--
+ d | D) clear; ###Log into Database### --Not on Menu--
 	dpsql;
 	;;
 
@@ -4919,7 +4949,6 @@ done
  	echo -e "\t6. Change user FDN"
  	echo -e "\t7. What deleted this (contact, email, folder, calendar)?"
  	echo -e "\t8. List subjects of deleted items from device"
- 	echo -e "\t9. List all devices from db"
 	echo -e "\n\t0. Back"
  	echo -n -e "\n\tSelection: "
  	read -n1 opt;
@@ -5117,13 +5146,43 @@ done
 		8) whatDeviceDeleted
 			;;
 
-		9) #Device Info
+		/q | q | 0) break;;
+		*) ;;
+		esac
+		done
+		;; 
+
+##################################################################################################
+#	
+#	User Information Menu
+#
+##################################################################################################
+	6) # User Information
+		while :
+		do
+		datasyncBanner;
+	 	 echo -e "\t1. List all devices from db"
+	 	 echo -e "\t2. List of GMS users & emails"
+		 echo -e "\n\t0. Back"
+		 echo -n -e "\n\tSelection: "
+		 read -n1 opt
+		 case $opt in
+
+		1) #Device Info
 			clear;
 			echo -e "\nBelow is a list of users and devices. For more details about each device (i.e. OS version), look up what is in the description column. For an iOS device, there could be a listing of Apple-iPhone3C1/902.176. Use the following website, http://enterpriseios.com/wiki/UserAgent to convert to an Apple product, iOS Version and Build.\n" | fold -s
 			mpsql << EOF
 			select u.userid, description, identifierstring, devicetype from devices d INNER JOIN users u ON d.userid = u.guid;
 EOF
 			read -p "Press [Enter] when finished.";
+			;;
+
+		2) # List of GMS users & emails
+			clear;
+			mpsql << EOF
+			select g.displayname, g.firstname, g.lastname, g.emailaddress from gal g INNER JOIN users ON (g.alias = users.name);
+EOF
+			eContinue
 			;;
 
 		/q | q | 0) break;;
@@ -5137,7 +5196,7 @@ EOF
 #	Checks & Queries Menu
 #
 ##################################################################################################
-	6) # Queries
+	7) # Queries
 		while :
 		do
 		datasyncBanner;
